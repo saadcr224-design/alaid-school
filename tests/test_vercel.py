@@ -39,7 +39,6 @@ class VercelTests(unittest.TestCase):
         self.assertEqual(json.dumps(result),'[{"paid": 150050}]')
     def test_routing_configuration(self):
         config=json.loads((Path(__file__).resolve().parents[1]/'vercel.json').read_text())
-        self.assertEqual(config['outputDirectory'],'public')
-        self.assertIn('api/index.py',config['functions'])
-        self.assertEqual(config['rewrites'][0],{'source':'/api/:path*','destination':'/api/index'})
+        self.assertEqual(config['builds'][0],{'src':'api/index.py','use':'@vercel/python'})
+        self.assertIn({'src':'/api/(.*)','dest':'/api/index.py'},config['routes'])
 if __name__=='__main__':unittest.main()
