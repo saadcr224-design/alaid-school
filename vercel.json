@@ -11,7 +11,7 @@
       "src": "/(.*)",
       "headers": {
         "X-Content-Type-Options": "nosniff",
-        "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; connect-src 'self' https://wctkzldkyjvggxidvdxm.supabase.co"
       },
       "continue": true
     },
