@@ -1,5 +1,7 @@
 """Alaid School: dependency-free Python 3.12 application and transactional SQLite API."""
 import os, json, sqlite3, secrets, hashlib, hmac, time, re
+from contextlib import contextmanager
+from threading import Lock
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
@@ -7,12 +9,21 @@ from urllib.parse import urlsplit, parse_qs
 from datetime import date
 from decimal import Decimal, InvalidOperation
 ROOT = Path(__file__).parent
+DATABASE_URL = os.environ.get('DATABASE_URL') or os.environ.get('POSTGRES_URL')
+class ConfigurationError(Exception): pass
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
+except ImportError:
+    psycopg = None
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
 DB = os.environ.get('DATABASE_PATH', str(ROOT / 'data/school.db'))
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('super_admin','admin','teacher')), active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY,user_id INTEGER REFERENCES users(id),expires INTEGER);
 CREATE TABLE IF NOT EXISTS attempts(key TEXT PRIMARY KEY, count INTEGER, until INTEGER);
-CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,start TEXT NOT NULL,end TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,start TEXT NOT NULL,"end" TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS records_scope ON records(session_id,kind);
 CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id),student_id INTEGER NOT NULL REFERENCES records(id),month TEXT NOT NULL,amount INTEGER NOT NULL CHECK(amount>=0),UNIQUE(session_id,student_id,month));
@@ -21,12 +32,59 @@ CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY,session_id INTEGER 
 CREATE TABLE IF NOT EXISTS salaries(id INTEGER PRIMARY KEY,session_id INTEGER REFERENCES sessions(id),staff_id INTEGER REFERENCES records(id),month TEXT,amount INTEGER CHECK(amount>0),created TEXT,UNIQUE(session_id,staff_id,month));
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,actor TEXT,action TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP);
 '''
-def connect():
-    c=sqlite3.connect(DB,timeout=20); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
+class PostgresConnection:
+    """Small adapter for the application's parameterized, portable SQL."""
+    def __init__(self, connection): self.connection = connection
+    def execute(self, sql, args=()):
+        if sql == 'BEGIN IMMEDIATE':
+            # Serialize money mutations across ALL serverless instances, not just
+            # threads. Acquired before any balance is read; released on commit.
+            return self.connection.execute('SELECT pg_advisory_xact_lock(71924001)')
+        return self.connection.execute(sql.replace('?', '%s'), args)
+    def commit(self): self.connection.commit()
 
+@contextmanager
+def connect():
+    if DATABASE_URL:
+        if psycopg is None: raise ConfigurationError('Install requirements.txt to enable PostgreSQL.')
+        # The provider's pooled URL is recommended. No persistent process pool
+        # or local filesystem is used; each request closes its connection.
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10,
+                             prepare_threshold=None) as connection:
+            yield PostgresConnection(connection)
+    else:
+        if os.environ.get('VERCEL'):
+            raise ConfigurationError('Connect a PostgreSQL database in Vercel Storage and set DATABASE_URL, then redeploy.')
+        c=sqlite3.connect(DB,timeout=20); c.row_factory=sqlite3.Row
+        c.execute('PRAGMA foreign_keys=ON')
+        try:
+            with c: yield c
+        finally: c.close()
+
+_initialized = False
+_init_lock = Lock()
 def init():
-    Path(DB).parent.mkdir(parents=True,exist_ok=True)
-    with connect() as c: c.execute('PRAGMA journal_mode=WAL'); c.executescript(SCHEMA)
+    if DATABASE_URL:
+        with connect() as c:
+            c.execute('SELECT pg_advisory_xact_lock(71924002)')
+            schema = SCHEMA.replace('INTEGER PRIMARY KEY', 'SERIAL PRIMARY KEY')
+            schema = schema.replace('amount INTEGER', 'amount BIGINT')
+            schema = schema.replace('DEFAULT CURRENT_TIMESTAMP', 'DEFAULT (CURRENT_TIMESTAMP::text)')
+            for statement in schema.split(';'):
+                if statement.strip(): c.execute(statement)
+    else:
+        if os.environ.get('VERCEL'):
+            raise ConfigurationError('Connect a PostgreSQL database in Vercel Storage and set DATABASE_URL, then redeploy.')
+        Path(DB).parent.mkdir(parents=True,exist_ok=True)
+        with connect() as c:
+            c.execute('PRAGMA journal_mode=WAL'); c.executescript(SCHEMA)
+
+def ensure_initialized():
+    global _initialized
+    if not _initialized:
+        with _init_lock:
+            if not _initialized:
+                init(); _initialized = True
 
 def password(p,salt=None):
     salt=salt or secrets.token_hex(16)
@@ -43,7 +101,9 @@ def txt(v):
 def month(v):
     if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',str(v)): raise ValueError('Choose a valid month.')
     return v
-def rows(c,sql,args=()): return [dict(r) for r in c.execute(sql,args)]
+def rows(c,sql,args=()):
+    # PostgreSQL SUM(bigint) is NUMERIC; money remains integer paisa in JSON.
+    return [{k:int(v) if isinstance(v,Decimal) and v==v.to_integral_value() else v for k,v in dict(r).items()} for r in c.execute(sql,args)]
 def ledger(c,sid):
     return rows(c,'''SELECT i.*,COALESCE(SUM(p.amount),0) paid,i.amount-COALESCE(SUM(p.amount),0) balance FROM invoices i LEFT JOIN payments p ON p.invoice_id=i.id WHERE i.session_id=? GROUP BY i.id ORDER BY i.month,i.id''',(sid,))
 
@@ -56,7 +116,7 @@ class Handler(BaseHTTPRequestHandler):
         if cookie: self.send_header('Set-Cookie',cookie)
         self.end_headers(); self.wfile.write(data)
     def cookie(self,token,age=28800):
-        return f'school_token={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}'+('; Secure' if os.environ.get('COOKIE_SECURE')=='1' else '')
+        return f'school_token={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}'+('; Secure' if (os.environ.get('COOKIE_SECURE')=='1' or bool(os.environ.get('VERCEL'))) else '')
     def do_GET(self): self.handle_request()
     def do_POST(self): self.handle_request()
     def handle_request(self):
@@ -69,6 +129,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type',{'html':'text/html; charset=utf-8','js':'text/javascript','css':'text/css'}[f.suffix[1:]])
                 self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
                 self.send_header('X-Content-Type-Options','nosniff'); self.end_headers(); self.wfile.write(data); return
+            ensure_initialized()
             body={}
             if self.command=='POST':
                 origin=self.headers.get('Origin')
@@ -82,7 +143,9 @@ class Handler(BaseHTTPRequestHandler):
                 result,cookie=self.api(c,u.path,parse_qs(u.query),body)
             self.reply(200,result,cookie)
         except PermissionError as e: self.reply(403,{'error':str(e)})
-        except (ValueError,KeyError,TypeError,sqlite3.IntegrityError) as e: self.reply(400,{'error':str(e) if not isinstance(e,sqlite3.IntegrityError) else 'This record already exists or is linked to other records.'})
+        except ConfigurationError as e: self.reply(503,{'code':'DATABASE_NOT_CONFIGURED','error':str(e)})
+        except INTEGRITY_ERRORS: self.reply(400,{'error':'This record already exists or is linked to other records.'})
+        except (ValueError,KeyError,TypeError) as e: self.reply(400,{'error':str(e)})
         except Exception:
             import traceback; traceback.print_exc(); self.reply(500,{'error':'Server error. Check server logs.'})
     def api(self,c,path,q,b):
@@ -102,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
             user=c.execute('SELECT * FROM users WHERE email=? AND active=1',(email,)).fetchone()
             if not user or not check(str(b.get('password','')),user['password']):
                 count=a['count']+1 if a and a['until']>now else 1
-                c.execute('INSERT OR REPLACE INTO attempts VALUES(?,?,?)',(key,count,now+900)); c.commit()
+                c.execute('INSERT INTO attempts(key,count,until) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET count=excluded.count,until=excluded.until',(key,count,now+900)); c.commit()
                 raise PermissionError('Invalid email or password.')
             c.execute('DELETE FROM attempts WHERE key=?',(key,)); token=secrets.token_urlsafe(32)
             c.execute('DELETE FROM tokens WHERE expires<?',(now,))
@@ -130,7 +193,7 @@ class Handler(BaseHTTPRequestHandler):
             if post:
                 start=date.fromisoformat(b['start']); end=date.fromisoformat(b['end'])
                 if start>=end: raise ValueError('End date must be after start date.')
-                c.execute('INSERT INTO sessions(name,start,end) VALUES(?,?,?)',(txt(b['name']),str(start),str(end)))
+                c.execute('INSERT INTO sessions(name,start,"end") VALUES(?,?,?)',(txt(b['name']),str(start),str(end)))
             return rows(c,'SELECT * FROM sessions ORDER BY start DESC'),None
         sid=int(b.get('session_id') or q.get('session_id',['0'])[0])
         if not c.execute('SELECT 1 FROM sessions WHERE id=?',(sid,)).fetchone(): raise ValueError('Create or select an academic session first.')
@@ -173,7 +236,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(ids,list) or not ids: raise ValueError('Select students.')
             for rid in set(map(int,ids)):
                 s=record(rid,'students')
-                c.execute('INSERT OR IGNORE INTO invoices(session_id,student_id,month,amount) VALUES(?,?,?,?)',(sid,rid,m,s['fee']))
+                c.execute('INSERT INTO invoices(session_id,student_id,month,amount) VALUES(?,?,?,?) ON CONFLICT(session_id,student_id,month) DO NOTHING',(sid,rid,m,s['fee']))
         elif path=='/api/pay':
             entries=b['entries']
             if not isinstance(entries,list) or not entries: raise ValueError('Enter at least one payment.')

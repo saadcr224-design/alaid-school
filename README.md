@@ -1,6 +1,6 @@
 # Alaid School — Management Desk
 
-Full-stack, responsive school management application with a Python API and automatically initialized SQLite database. No third-party runtime dependencies. Intended for a single school running one server instance with a persistent disk.
+Full-stack, responsive school management application with a Python API and automatically initialized SQLite database. Runs locally with SQLite or on Vercel with a durable PostgreSQL database. PostgreSQL support uses psycopg.
 
 ## Included
 
@@ -38,9 +38,32 @@ Open http://localhost:8000. Enter the setup key and create the super admin with 
 
 The database is created at `data/school.db` automatically. No database account or external API key is required. `.env.example` documents variables; the server reads real environment variables and does not automatically load `.env` files.
 
-## Deploy with persistent storage
+## Deploy on Vercel (alaid-school.vercel.app)
 
-GitHub stores source code; it does not run this backend. Use a VPS or a container host supporting a persistent disk. Do not deploy the SQLite database on an ephemeral serverless filesystem (such as a Vercel function). Cloud database provisioning and hosting have **not** been performed by committing this repository.
+The repository now includes a Python Function (`api/index.py`) and explicit `/api/*` routing. Vercel hosts the frontend and backend; a PostgreSQL provider stores the records permanently. SQLite is **never** used on Vercel, including `/tmp`.
+
+1. In the **alaid-school** Vercel project, use **Settings → Git** to connect `saadcr224-design/alaid-school`, with **main** as the production branch. Leave automatic Git deployments enabled.
+2. **Root Directory** must be the repository root (blank), not `public`. Framework is **Other**. `vercel.json` supplies the `public` output directory and API configuration. Remove conflicting dashboard build overrides.
+3. Under **Storage**, connect a PostgreSQL database (Neon is supported). Connect it to this project for **Production**. Ensure the integration supplies `DATABASE_URL` or `POSTGRES_URL` using its pooled connection string. Keep the provider's SSL requirements in the URL. No database secrets belong in GitHub or browser code.
+4. In **Settings → Environment Variables**, add a strong random `SETUP_KEY` for Production. Generate one locally using `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Keep this key private: it authorizes first-admin creation. HTTPS cookies are automatic on Vercel.
+5. Redeploy the latest **main** commit after connecting the database or changing environment variables. The schema is created automatically on the first API request under a database lock. Existing data is preserved.
+6. Visit the site and complete first-admin setup using your setup key. If a setup account already exists, sign in instead.
+
+`/api/status` returns JSON when the backend is running. If the database URL is absent, it returns HTTP 503 with `DATABASE_NOT_CONFIGURED` and the UI shows instructions. A 404 means the deployed commit/root directory is still incorrect.
+
+### GitHub first → Vercel automatically
+
+Commit and push code changes to this repository's **main** branch. Vercel's native Git integration builds that commit and updates `https://alaid-school.vercel.app/` after a successful production deployment. Feature branches create previews. Environment variable changes require redeployment. Student/payment edits are database writes and intentionally do not create Git commits.
+
+The Git integration must be enabled in the project; uploading source alone cannot turn it on. Confirm each deployment's source commit under Vercel Deployments. Deployment may fail if GitHub integration permissions or the commit author's Vercel team access are missing.
+
+### Verification status
+
+The prior deployment returned HTTP 404 at `/api/status`. API routing and PostgreSQL support are now included. Connecting the Production database and setting `SETUP_KEY` require project settings access. A successful static page deployment alone does not verify database connectivity. The SQLite file from an earlier local/Docker run is not automatically imported into PostgreSQL.
+
+## Optional Docker deployment
+
+For local-disk SQLite, run one server instance with a persistent volume. For PostgreSQL, supply `DATABASE_URL` and install `requirements.txt`. A Vercel deployment needs neither a Docker container nor a persistent filesystem.
 
 Build and run on a Docker host:
 
