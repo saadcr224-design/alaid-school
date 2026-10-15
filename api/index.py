@@ -263,9 +263,34 @@ class Handler(BaseHTTPRequestHandler):
         c.execute('INSERT INTO audit(actor,action) VALUES(?,?)',(user['email'],json.dumps({'path':path,'session':sid,'record':b.get('id'),'month':b.get('month')})))
         return {'ok':True},None
 
-# Vercel's file-based runtime requires this top-level entrypoint name.
-class handler(Handler):
-    pass
+# Standard WSGI entrypoint; database access remains lazy.
+from flask import Flask, request, Response
+from io import BytesIO
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 100000
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    return {'ok': True, 'service': 'alaid-school', 'runtime': 'flask',
+            'database_configured': bool(DATABASE_URL)}
+
+@app.route('/api/<path:operation>', methods=['GET', 'POST'])
+def dispatch(operation):
+    # Reuse the tested application logic, without a socket-based HTTP adapter.
+    h = object.__new__(Handler)
+    h.path = request.full_path.rstrip('?')
+    h.command = request.method
+    h.headers = request.headers
+    h.rfile = BytesIO(request.get_data())
+    h.wfile = BytesIO()
+    response_status = [200]
+    response_headers = []
+    h.send_response = lambda status: response_status.__setitem__(0, status)
+    h.send_header = lambda key, value: response_headers.append((key, value))
+    h.end_headers = lambda: None
+    h.handle_request()
+    return Response(h.wfile.getvalue(), status=response_status[0], headers=response_headers)
 
 if __name__=='__main__':
     init(); port=int(os.environ.get('PORT','8000'))

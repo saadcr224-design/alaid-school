@@ -4,11 +4,11 @@ from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import server
-from api.index import handler
+from api.index import app, Handler as handler
 from decimal import Decimal
 class VercelTests(unittest.TestCase):
     def test_entrypoint_uses_school_handler(self):
-        self.assertTrue(issubclass(handler,server.Handler))
+        self.assertEqual(app.test_client().get('/api/health').status_code,200)
     def test_vercel_cannot_fall_back_to_sqlite(self):
         with patch.object(server,'DATABASE_URL',None),patch.dict(os.environ,{'VERCEL':'1'}):
             with self.assertRaises(server.ConfigurationError):
@@ -19,6 +19,12 @@ class VercelTests(unittest.TestCase):
         h.send_response=lambda s:statuses.append(s);h.send_header=lambda *a:None;h.end_headers=lambda:None
         with patch.object(server,'DATABASE_URL',None),patch.object(server,'_initialized',False),patch.dict(os.environ,{'VERCEL':'1'}):h.handle_request()
         self.assertEqual(statuses,[503]);self.assertEqual(json.loads(h.wfile.getvalue())['code'],'DATABASE_NOT_CONFIGURED')
+    def test_wsgi_database_error(self):
+        with patch.object(server,'DATABASE_URL',None),patch.object(server,'_initialized',False),patch.dict(os.environ,{'VERCEL':'1'}):
+            result=app.test_client().get('/api/status')
+            self.assertEqual(result.status_code,503)
+            self.assertEqual(result.json['code'],'DATABASE_NOT_CONFIGURED')
+
     def test_postgres_write_lock_and_parameters(self):
         class Connection:
             def execute(self,*args): self.args=args;return args
