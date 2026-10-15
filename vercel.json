@@ -2,10 +2,6 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "builds": [
     {
-      "src": "api/index.py",
-      "use": "@vercel/python"
-    },
-    {
       "src": "public/**",
       "use": "@vercel/static"
     }
@@ -18,10 +14,6 @@
         "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
       },
       "continue": true
-    },
-    {
-      "src": "/api/(.*)",
-      "dest": "/api/index.py"
     },
     {
       "src": "/",
